@@ -317,6 +317,18 @@ def run_buyer_once():
 
         # 0.5% of available funds per pair => notional / price = units
         units = int(round(notional_per_trade / rounded_price))
+
+        # ---- 1-unit fallback ----
+        if units <= 0 and notional_per_trade > 0:
+            logger.info(
+                "Computed units < 1 for %s (notional=%.4f, price=%.8f); "
+                "using minimum 1 unit instead.",
+                pair,
+                notional_per_trade,
+                rounded_price,
+            )
+            units = 1
+
         if units <= 0:
             logger.warning(
                 "Computed units <= 0 for %s (notional=%.4f, price=%.8f); skipping",
