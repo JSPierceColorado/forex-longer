@@ -27,14 +27,12 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------
-# Google Sheets (optional logging only)
+# Google Sheets helpers
 # ------------------------
 
 def get_gspread_client() -> gspread.Client:
     """Authenticate to Google Sheets using a service account JSON in env GOOGLE_CREDS_JSON."""
-    creds_json = os.environ.get("GOOGLE_CREDS_JSON")
-    if not creds_json:
-        raise RuntimeError("GOOGLE_CREDS_JSON not set")
+    creds_json = os.environ["GOOGLE_CREDS_JSON"]
     info = json.loads(creds_json)
     credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
     client = gspread.authorize(credentials)
@@ -43,15 +41,10 @@ def get_gspread_client() -> gspread.Client:
 
 def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -> None:
     """
-    Write screener results to a Google Sheet for visibility only.
-    This is NOT used as input for trading logic.
+    Create/replace the screener tab data in columns A:Q ONLY.
+    Columns R onward are left untouched so user formulas & notes persist.
     """
-    try:
-        gc = get_gspread_client()
-    except Exception as exc:
-        logger.warning("Skipping sheet write (auth issue): %s", exc)
-        return
-
+    gc = get_gspread_client()
     sh = gc.open(sheet_name)
 
     try:
@@ -60,7 +53,7 @@ def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -
         ws = sh.add_worksheet(
             title=tab_name,
             rows=str(len(df) + 100),
-            cols="30",
+            cols="30",  # give some room for user columns (R+)
         )
 
     header = df.columns.tolist()
@@ -70,6 +63,7 @@ def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -
     num_data_rows = len(values)
     num_data_cols = len(header)
 
+    # Make sure we cover all existing rows in A:Q so old data gets cleared
     max_rows = max(ws.row_count, num_data_rows)
     blank_grid = [[""] * num_data_cols for _ in range(max_rows)]
 
@@ -79,7 +73,7 @@ def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -
 
     ws.update(range_name="A1", values=blank_grid)
     logger.info(
-        "Updated sheet '%s' tab '%s' with %d data rows",
+        "Updated sheet '%s' tab '%s' A:Q with %d data rows",
         sheet_name,
         tab_name,
         len(df),
@@ -238,14 +232,15 @@ def place_market_order(
 # ------------------------
 
 def build_pip_location_map_from_instruments(
-    fx_instruments: List[Dict[str, Any]],
+    instruments: List[Dict[str, Any]],
 ) -> Dict[str, int]:
     """
     Build a dict: { "EUR_USD": -4, "USD_JPY": -2, ... }
-    using Oanda's pipLocation field on a list of instruments.
+    using Oanda's pipLocation from the instruments endpoint.
     """
     pip_map: Dict[str, int] = {}
-    for ins in fx_instruments:
+
+    for ins in instruments:
         name = ins.get("name")
         pip_loc = ins.get("pipLocation")
         if name is None or pip_loc is None:
@@ -253,7 +248,9 @@ def build_pip_location_map_from_instruments(
         try:
             pip_map[name] = int(pip_loc)
         except Exception:
-            pip_map[name] = -4  # safe fallback
+            # Fallback if parsing fails
+            pip_map[name] = -4
+
     return pip_map
 
 
@@ -267,7 +264,7 @@ def round_price_to_pip(price: float, pip_location: int) -> float:
 
 
 # ------------------------
-# Indicator helpers (UT-style logic)
+# Indicator helpers (UT-style LONG logic)
 # ------------------------
 
 def compute_atr_series(
@@ -319,7 +316,7 @@ def compute_ut_trailing_stop(
     atr_mult: float = 1.2,
 ) -> Optional[pd.Series]:
     """
-    SuperTrend-style trailing stop:
+    Reproduce the SuperTrend-style trailing stop logic from the Pine script.
 
     - Long regime: stop trails up, never down
     - Short regime: stop trails down, never up
@@ -334,6 +331,7 @@ def compute_ut_trailing_stop(
 
     stop = pd.Series(index=price.index, dtype=float)
 
+    # Initialize stop same way as Pine: price - entryLoss
     entry_loss0 = atr_mult * atr.iloc[first_valid]
     prev_stop = price.iloc[first_valid] - entry_loss0
     stop.iloc[first_valid] = prev_stop
@@ -345,12 +343,16 @@ def compute_ut_trailing_stop(
         entry_loss = atr_mult * atr.iloc[i]
 
         if p > prev_stop and p1 > prev_stop:
+            # Long regime: trail up, never down
             stop_val = max(prev_stop, p - entry_loss)
         elif p < prev_stop and p1 < prev_stop:
+            # Short regime: trail down, never up
             stop_val = min(prev_stop, p + entry_loss)
         elif p > prev_stop:
+            # Flip to long
             stop_val = p - entry_loss
         else:
+            # Flip to short
             stop_val = p + entry_loss
 
         stop.iloc[i] = stop_val
@@ -377,13 +379,16 @@ def compute_buy_signal_and_metrics(
     daily_closes: List[float],
 ) -> Optional[Dict[str, Any]]:
     """
-    Apply the UT-style H1 logic and daily SMA 240 filter.
+    Apply the UT-style H1 logic and daily SMA 240 filter (LONG side).
 
-    Returns a dict with metrics if conditions are met, otherwise None.
+    Conditions:
+      - UT-style H1 buy (price crossing above trailing stop)
+      - AND last price is BELOW the daily 240-SMA
     """
-    if len(h1_closes) < 20:
+    if len(h1_closes) < 20:  # just a minimal sanity check
         return None
 
+    # 1) ATR & trailing stop on H1
     atr_series = compute_atr_series(h1_highs, h1_lows, h1_closes, period=10)
     if atr_series is None:
         return None
@@ -392,11 +397,13 @@ def compute_buy_signal_and_metrics(
     if stop_series is None:
         return None
 
+    # We need at least 2 valid stop values to detect crossover
     if stop_series.isna().sum() > len(stop_series) - 2:
         return None
 
     last_idx = len(h1_closes) - 1
 
+    # Ensure last two stops are not NaN
     if pd.isna(stop_series.iloc[last_idx]) or pd.isna(stop_series.iloc[last_idx - 1]):
         return None
 
@@ -405,16 +412,19 @@ def compute_buy_signal_and_metrics(
     stop_prev = stop_series.iloc[last_idx - 1]
     stop_last = stop_series.iloc[last_idx]
 
+    # Buy condition (equivalent to ta.crossover(price, stop) && price > stop)
     crossed_up = price_prev <= stop_prev and price_last > stop_last
     buy_signal = crossed_up and (price_last > stop_last)
 
     if not buy_signal:
         return None
 
+    # 2) Daily SMA 240 as "buy zone"
     daily_ma = compute_daily_sma(daily_closes, length=240)
     if daily_ma is None or daily_ma <= 0:
         return None
 
+    # Require price be BELOW the daily SMA
     below_ma = price_last < daily_ma
     if not below_ma:
         return None
@@ -433,27 +443,30 @@ def compute_buy_signal_and_metrics(
 
 
 # ------------------------
-# One-pass screener + buyer
+# Combined screener + LONG opener
 # ------------------------
 
 def run_bot_once():
     """
-    Fully autonomous cycle:
-      - Scan all tradable FX instruments on Oanda.
-      - For each:
-          * Compute UT-style H1 buy signal + below 240-day SMA.
-          * If conditions are met:
-              - Compute position size as BUYER_ALLOCATION_PERCENT% of marginAvailable.
-              - Place a MARKET BUY and move to the next pair.
-      - Optionally log all candidates to a Google Sheet (for visibility only).
+    - Scan all tradable FX instruments on Oanda.
+    - For each instrument:
+        * Use H1 + Daily data with UT-style LONG logic:
+            - H1 UT buy signal
+            - Price below Daily SMA240
+        * If conditions are met:
+            - Size a LONG position as BUYER_ALLOCATION_PERCENT% of marginAvailable.
+            - Place a MARKET BUY order.
+    - Log results to a Google Sheets tab (for visibility only).
     """
     session, base_url = get_oanda_session()
     account_id = os.environ["OANDA_ACCOUNT_ID"]
 
-    fx_instruments = fetch_instruments(session, base_url, account_id)
-    pip_map = build_pip_location_map_from_instruments(fx_instruments)
+    # Fetch all FX instruments and build pip map
+    instruments_meta = fetch_instruments(session, base_url, account_id)
+    instrument_names = [ins.get("name") for ins in instruments_meta if ins.get("name")]
+    pip_map = build_pip_location_map_from_instruments(instruments_meta)
 
-    # Account summary (use marginAvailable as 'available funds')
+    # Fetch account summary (available funds)
     account = fetch_account_summary(session, base_url, account_id)
     margin_available_str = account.get("marginAvailable") or account.get("NAV") or account.get("balance")
     margin_available = float(margin_available_str)
@@ -463,13 +476,14 @@ def run_bot_once():
 
     if margin_available <= 0 or alloc_fraction <= 0:
         logger.warning(
-            "Non-positive margin_available=%.4f or allocation fraction=%.4f; skipping all trades.",
+            "Non-positive margin_available=%.4f or allocation fraction=%.4f; skipping trading.",
             margin_available,
             alloc_fraction,
         )
-        return
+        notional_per_trade = 0.0
+    else:
+        notional_per_trade = margin_available * alloc_fraction
 
-    notional_per_trade = margin_available * alloc_fraction
     logger.info(
         "marginAvailable=%.4f, allocation=%.4f%% => notional_per_trade=%.4f",
         margin_available,
@@ -477,138 +491,168 @@ def run_bot_once():
         notional_per_trade,
     )
 
-    screener_rows: List[Dict[str, Any]] = []
+    # First pass: find all candidates with LONG signals
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
 
-    # First: determine all candidates and collect their pairs
-    candidate_pairs: List[str] = []
-
-    for ins in fx_instruments:
-        name = ins.get("name")
-        if not name:
-            continue
+    for name in instrument_names:
         try:
-            logger.info("Evaluating %s", name)
-
-            # Daily data for SMA 240
+            # Daily candles for SMA240
             daily_closes, _, _, _ = fetch_candles(
                 session, base_url, name, granularity="D", count=300
             )
 
-            # H1 data for ATR/trailing stop
+            # H1 candles for UT logic
             h1_closes, h1_highs, h1_lows, _ = fetch_candles(
                 session, base_url, name, granularity="H1", count=400
             )
 
-            if not daily_closes or not h1_closes:
-                logger.warning("Missing data for %s", name)
-                continue
+        except Exception as exc:
+            logger.exception("Failed to fetch candles for %s: %s", name, exc)
+            continue
 
-            metrics = compute_buy_signal_and_metrics(
-                h1_closes=h1_closes,
-                h1_highs=h1_highs,
-                h1_lows=h1_lows,
-                daily_closes=daily_closes,
-            )
+        if not daily_closes or not h1_closes:
+            logger.warning("Missing data for %s", name)
+            continue
 
-            if metrics is None:
-                continue
+        metrics = compute_buy_signal_and_metrics(
+            h1_closes=h1_closes,
+            h1_highs=h1_highs,
+            h1_lows=h1_lows,
+            daily_closes=daily_closes,
+        )
+
+        if metrics is not None:
+            candidates.append((name, metrics))
+
+    # Build DataFrame rows for sheet logging (including order info)
+    rows_for_sheet: List[Dict[str, Any]] = []
+    now_str = pd.Timestamp.utcnow().isoformat()
+
+    if not candidates:
+        logger.info("No instruments met UT-buy + below-Daily-SMA240 conditions this run.")
+
+        df = pd.DataFrame(columns=[
+            "pair",
+            "last_price",
+            "daily_MA240",
+            "%_below_MA240",
+            "H1_ATR10",
+            "H1_trailing_stop",
+            "buy_signal_H1",
+            "long_units",
+            "entry_price_used",
+            "order_status",
+            "updated_at",
+        ])
+    else:
+        logger.info("Found %d LONG candidates with UT buy signals.", len(candidates))
+
+        # Fetch pricing for all candidates in one call
+        price_map = fetch_pricing(session, base_url, account_id, [pair for pair, _ in candidates])
+
+        for pair, metrics in candidates:
+            order_status = "NOT_ATTEMPTED"
+            long_units: Optional[int] = None
+            entry_price_used: Optional[float] = None
+
+            try:
+                price_info = price_map.get(pair)
+                if price_info is None:
+                    logger.warning("No pricing info for %s; skipping order.", pair)
+                    order_status = "SKIPPED_NO_PRICE"
+                elif notional_per_trade <= 0:
+                    order_status = "SKIPPED_NO_FUNDS"
+                else:
+                    # For longs, we assume entry near the *ask*
+                    ask = price_info["ask"]
+                    pip_loc = pip_map.get(pair, -4)
+                    rounded_price = round_price_to_pip(ask, pip_loc)
+
+                    if rounded_price <= 0:
+                        logger.warning(
+                            "Rounded ask price for %s is non-positive (%.8f); skipping.",
+                            pair,
+                            rounded_price,
+                        )
+                        order_status = "SKIPPED_BAD_PRICE"
+                    else:
+                        units = int(round(notional_per_trade / rounded_price))
+
+                        # ---- 1-unit fallback ----
+                        if units <= 0 and notional_per_trade > 0:
+                            logger.info(
+                                "Computed units < 1 for %s (notional=%.4f, price=%.8f); "
+                                "using minimum 1 unit instead.",
+                                pair,
+                                notional_per_trade,
+                                rounded_price,
+                            )
+                            units = 1
+
+                        if units <= 0:
+                            logger.warning(
+                                "Computed units <= 0 for %s (notional=%.4f, price=%.8f); skipping",
+                                pair,
+                                notional_per_trade,
+                                rounded_price,
+                            )
+                            order_status = "SKIPPED_ZERO_UNITS"
+                        else:
+                            logger.info(
+                                "Placing LONG market order: pair=%s, units=%d, approx_price=%.8f (pipLocation=%d)",
+                                pair,
+                                units,
+                                rounded_price,
+                                pip_loc,
+                            )
+                            resp = place_market_order(session, base_url, account_id, pair, units)
+                            logger.info("Order response for %s: %s", pair, json.dumps(resp))
+
+                            long_units = units
+                            entry_price_used = rounded_price
+                            order_status = "FILLED"
+
+            except Exception as exc:
+                logger.exception("Failed to place long order for %s: %s", pair, exc)
+                order_status = "ERROR"
 
             row = {
-                "pair": name,
+                "pair": pair,
                 "last_price": metrics["last_price"],
                 "daily_MA240": metrics["daily_ma240"],
                 "%_below_MA240": metrics["pct_below_ma"],
                 "H1_ATR10": metrics["h1_atr10"],
                 "H1_trailing_stop": metrics["h1_trailing_stop"],
                 "buy_signal_H1": metrics["buy_signal_h1"],
-                "updated_at": pd.Timestamp.utcnow().isoformat(),
+                "long_units": long_units if long_units is not None else "",
+                "entry_price_used": entry_price_used if entry_price_used is not None else "",
+                "order_status": order_status,
+                "updated_at": now_str,
             }
-            screener_rows.append(row)
-            candidate_pairs.append(name)
+            rows_for_sheet.append(row)
 
-        except Exception as exc:
-            logger.exception("Failed to evaluate %s: %s", name, exc)
-
-    # Optional: write candidates to sheet for visibility
-    columns = [
-        "pair",
-        "last_price",
-        "daily_MA240",
-        "%_below_MA240",
-        "H1_ATR10",
-        "H1_trailing_stop",
-        "buy_signal_H1",
-        "updated_at",
-    ]
-    df = pd.DataFrame(screener_rows, columns=columns) if screener_rows else pd.DataFrame(columns=columns)
+        df = pd.DataFrame(rows_for_sheet)
+        # Stable column ordering
+        columns = [
+            "pair",
+            "last_price",
+            "daily_MA240",
+            "%_below_MA240",
+            "H1_ATR10",
+            "H1_trailing_stop",
+            "buy_signal_H1",
+            "long_units",
+            "entry_price_used",
+            "order_status",
+            "updated_at",
+        ]
+        df = df[columns]
 
     sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
-    screener_tab = os.getenv("OANDA_UT_SCREENER_TAB", "Oanda-UT-Screener")
-    if os.environ.get("GOOGLE_CREDS_JSON"):
-        write_dataframe_to_sheet(df, sheet_name, screener_tab)
+    # Reuse the same env var as the old screener for compatibility
+    screener_tab = os.getenv("OANDA_UT_SCREENER_TAB", "Oanda-UT-Long-Combined")
 
-    if not candidate_pairs:
-        logger.info("No UT-style buy + below-MA240 setups this run; no trades placed.")
-        return
-
-    logger.info("Found %d candidates this run; fetching prices and placing trades.", len(candidate_pairs))
-
-    prices = fetch_pricing(session, base_url, account_id, candidate_pairs)
-
-    trades_placed = 0
-
-    # Now: for each candidate, size and place the order
-    for row in screener_rows:
-        pair = row["pair"]
-        price_info = prices.get(pair)
-        if not price_info:
-            logger.warning("No pricing info for %s; skipping", pair)
-            continue
-
-        ask = price_info["ask"]
-        pip_loc = pip_map.get(pair, -4)
-
-        rounded_price = round_price_to_pip(ask, pip_loc)
-        if rounded_price <= 0:
-            logger.warning("Rounded ask price for %s is non-positive (%.8f); skipping", pair, rounded_price)
-            continue
-
-        units = int(round(notional_per_trade / rounded_price))
-
-        if units <= 0 and notional_per_trade > 0:
-            logger.info(
-                "Computed units < 1 for %s (notional=%.4f, price=%.8f); using minimum 1 unit instead.",
-                pair,
-                notional_per_trade,
-                rounded_price,
-            )
-            units = 1
-
-        if units <= 0:
-            logger.warning(
-                "Computed units <= 0 for %s (notional=%.4f, price=%.8f); skipping",
-                pair,
-                notional_per_trade,
-                rounded_price,
-            )
-            continue
-
-        try:
-            logger.info(
-                "Placing BUY market order: pair=%s, units=%d, approx_price=%.8f (pipLocation=%d)",
-                pair,
-                units,
-                rounded_price,
-                pip_loc,
-            )
-            resp = place_market_order(session, base_url, account_id, pair, units)
-            logger.info("Order response for %s: %s", pair, json.dumps(resp))
-            trades_placed += 1
-
-        except Exception as exc:
-            logger.exception("Failed to place order for %s: %s", pair, exc)
-
-    logger.info("Finished run: placed %d BUY trades.", trades_placed)
+    write_dataframe_to_sheet(df, sheet_name, screener_tab)
 
 
 # ------------------------
@@ -621,23 +665,19 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    interval_seconds = int(
-        os.getenv(
-            "UT_BOT_INTERVAL_SECONDS",
-            os.getenv("UT_SCREENER_INTERVAL_SECONDS", "3600"),  # default 1 hour
-        )
-    )
+    # Default: rerun every hour (3600s) to align with H1 bar closes
+    interval_seconds = int(os.getenv("UT_LONG_INTERVAL_SECONDS", "3600"))
 
     logger.info(
-        "Starting autonomous Oanda bot loop (interval=%ss, buys %.3f%% of marginAvailable per pair)...",
-        interval_seconds,
+        "Starting UT-style LONG screener+opener (%.3f%% allocation, interval=%ss)",
         float(os.getenv("BUYER_ALLOCATION_PERCENT", "0.5")),
+        interval_seconds,
     )
 
     while True:
         try:
             run_bot_once()
         except Exception as exc:
-            logger.exception("Error in Oanda bot loop: %s", exc)
+            logger.exception("Error in UT LONG combined bot loop: %s", exc)
         logger.info("Sleeping for %s seconds...", interval_seconds)
         time.sleep(interval_seconds)
