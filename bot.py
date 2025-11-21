@@ -26,9 +26,9 @@ SCOPES = [
 logger = logging.getLogger(__name__)
 
 
-# ========================
+# ------------------------
 # Google Sheets helpers
-# ========================
+# ------------------------
 
 def get_gspread_client() -> gspread.Client:
     """Authenticate to Google Sheets using a service account JSON in env GOOGLE_CREDS_JSON."""
@@ -76,54 +76,16 @@ def write_dataframe_to_sheet(df: pd.DataFrame, sheet_name: str, tab_name: str) -
     # Update starting at A1, only for our data columns
     ws.update(range_name="A1", values=blank_grid)
     logger.info(
-        "Updated sheet '%s' tab '%s' A:? with %d data rows",
+        "Updated sheet '%s' tab '%s' with %d data rows",
         sheet_name,
         tab_name,
         len(df),
     )
 
 
-def get_screener_rows(sheet_name: str, tab_name: str) -> Tuple[gspread.Worksheet, List[Tuple[int, str]]]:
-    """
-    Read the screener tab and return:
-      - the worksheet object
-      - a list of (row_number, pair_name) for non-empty rows.
-
-    row_number is 1-based index in Sheets.
-    """
-    gc = get_gspread_client()
-    sh = gc.open(sheet_name)
-    ws = sh.worksheet(tab_name)
-
-    records = ws.get_all_records()  # list of dicts, header = row 1
-    rows: List[Tuple[int, str]] = []
-
-    for i, rec in enumerate(records):
-        pair = rec.get("pair")
-        if pair:
-            # +2 because get_all_records starts at row 2, and indices are 0-based
-            row_number = i + 2
-            rows.append((row_number, pair))
-
-    return ws, rows
-
-
-def delete_sheet_rows(ws: gspread.Worksheet, row_numbers: List[int]) -> None:
-    """
-    Delete the given row numbers from the worksheet.
-    Delete from bottom to top so indices don't shift.
-    """
-    if not row_numbers:
-        return
-
-    for rn in sorted(row_numbers, reverse=True):
-        logger.info("Deleting row %s from screener sheet", rn)
-        ws.delete_rows(rn)
-
-
-# ========================
+# ------------------------
 # Oanda helpers
-# ========================
+# ------------------------
 
 def get_oanda_session():
     token = os.environ["OANDA_API_TOKEN"]
@@ -268,22 +230,18 @@ def place_market_order(
     return data
 
 
-# ========================
+# ------------------------
 # Pip helpers
-# ========================
+# ------------------------
 
-def build_pip_location_map(
-    session: requests.Session,
-    base_url: str,
-    account_id: str,
+def build_pip_location_map_from_instruments(
+    fx_instruments: List[Dict[str, Any]],
 ) -> Dict[str, int]:
     """
     Build a dict: { "EUR_USD": -4, "USD_JPY": -2, ... }
-    using Oanda's pipLocation from the instruments endpoint.
+    using Oanda's pipLocation field on a list of instruments.
     """
-    fx_instruments = fetch_instruments(session, base_url, account_id)
     pip_map: Dict[str, int] = {}
-
     for ins in fx_instruments:
         name = ins.get("name")
         pip_loc = ins.get("pipLocation")
@@ -292,9 +250,7 @@ def build_pip_location_map(
         try:
             pip_map[name] = int(pip_loc)
         except Exception:
-            # Fallback if parsing fails
-            pip_map[name] = -4
-
+            pip_map[name] = -4  # safe fallback
     return pip_map
 
 
@@ -307,9 +263,9 @@ def round_price_to_pip(price: float, pip_location: int) -> float:
     return round(price, decimals)
 
 
-# ========================
+# ------------------------
 # Indicator helpers (UT-style logic)
-# ========================
+# ------------------------
 
 def compute_atr_series(
     highs: List[float],
@@ -360,7 +316,7 @@ def compute_ut_trailing_stop(
     atr_mult: float = 1.2,
 ) -> Optional[pd.Series]:
     """
-    Reproduce the SuperTrend-style trailing stop logic from the Pine script.
+    SuperTrend-style trailing stop:
 
     - Long regime: stop trails up, never down
     - Short regime: stop trails down, never up
@@ -375,7 +331,7 @@ def compute_ut_trailing_stop(
 
     stop = pd.Series(index=price.index, dtype=float)
 
-    # Initialize stop same way as Pine: price - entryLoss
+    # Initialize stop similar to Pine: price - entryLoss
     entry_loss0 = atr_mult * atr.iloc[first_valid]
     prev_stop = price.iloc[first_valid] - entry_loss0
     stop.iloc[first_valid] = prev_stop
@@ -427,7 +383,7 @@ def compute_buy_signal_and_metrics(
 
     Returns a dict with metrics if conditions are met, otherwise None.
     """
-    if len(h1_closes) < 20:  # just a minimal sanity check
+    if len(h1_closes) < 20:  # minimal sanity check
         return None
 
     # 1) ATR & trailing stop on H1
@@ -439,7 +395,7 @@ def compute_buy_signal_and_metrics(
     if stop_series is None:
         return None
 
-    # We need at least 2 valid stop values to detect crossover
+    # Need at least 2 valid stop values to detect crossover
     if stop_series.isna().sum() > len(stop_series) - 2:
         return None
 
@@ -484,9 +440,9 @@ def compute_buy_signal_and_metrics(
     return result
 
 
-# ========================
-# Screener logic
-# ========================
+# ------------------------
+# Screener row builder
+# ------------------------
 
 def build_instrument_row(
     session: requests.Session,
@@ -538,104 +494,77 @@ def build_instrument_row(
     return row
 
 
-def run_screener_once():
+# ------------------------
+# Combined screener + buyer
+# ------------------------
+
+def run_bot_once():
     """
-    Scan all tradable FX instruments on Oanda and
-    write ONLY the pairs that:
-      - have a UT-style buy signal on H1, and
-      - are trading below the 240-day SMA.
+    - Scan all tradable FX instruments on Oanda.
+    - For each that has:
+        * UT-style H1 buy signal, AND
+        * price below 240-day SMA,
+      we:
+        * Log it in a Google Sheet (optional visibility), and
+        * Immediately place a MARKET BUY sized at BUYER_ALLOCATION_PERCENT% of marginAvailable.
     """
     session, base_url = get_oanda_session()
     account_id = os.environ["OANDA_ACCOUNT_ID"]
 
-    instruments = fetch_instruments(session, base_url, account_id)
+    # 1) Screener: find all candidates in this run
+    fx_instruments = fetch_instruments(session, base_url, account_id)
 
-    rows: List[Dict[str, Any]] = []
+    screener_rows: List[Dict[str, Any]] = []
 
-    for ins in instruments:
+    for ins in fx_instruments:
         name = ins.get("name")
         if not name:
             continue
         try:
-            logger.info("Processing %s", name)
+            logger.info("Screening %s", name)
             row = build_instrument_row(session, base_url, name)
             if row:
-                rows.append(row)
+                screener_rows.append(row)
         except Exception as exc:
             logger.exception("Failed to build row for %s: %s", name, exc)
 
-    if not rows:
-        logger.info("No instruments met UT-buy + below-MA240 conditions this run.")
-        # Still write an empty sheet with just headers so you see it's working
-        df = pd.DataFrame(columns=[
-            "pair",
-            "last_price",
-            "daily_MA240",
-            "%_below_MA240",
-            "H1_ATR10",
-            "H1_trailing_stop",
-            "buy_signal_H1",
-            "updated_at",
-        ])
+    # Build DataFrame for logging / sheet output
+    columns = [
+        "pair",
+        "last_price",
+        "daily_MA240",
+        "%_below_MA240",
+        "H1_ATR10",
+        "H1_trailing_stop",
+        "buy_signal_H1",
+        "updated_at",
+    ]
+
+    if screener_rows:
+        df = pd.DataFrame(screener_rows)[columns]
     else:
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(columns=columns)
 
-        # Stable column ordering
-        columns = [
-            "pair",
-            "last_price",
-            "daily_MA240",
-            "%_below_MA240",
-            "H1_ATR10",
-            "H1_trailing_stop",
-            "buy_signal_H1",
-            "updated_at",
-        ]
-        df = df[columns]
-
+    # 2) Write screener output to sheet (for visibility only)
     sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
     screener_tab = os.getenv("OANDA_UT_SCREENER_TAB", "Oanda-UT-Screener")
-
-    write_dataframe_to_sheet(df, sheet_name, screener_tab)
-
-
-# ========================
-# Buyer logic
-# ========================
-
-def run_buyer_once():
-    """
-    - Read all pairs from the UT screener sheet.
-    - For each pair:
-        * Compute a notional = BUYER_ALLOCATION_PERCENT% of available funds (marginAvailable).
-        * Convert that notional to units using the ask price (rounded to pip).
-        * Place a MARKET buy order.
-        * If successful, delete that row from the sheet.
-    """
-    session, base_url = get_oanda_session()
-    account_id = os.environ["OANDA_ACCOUNT_ID"]
-
-    # Screener sheet info (reuse same envs as screener)
-    sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Active-Investing")
-    screener_tab = os.getenv("OANDA_UT_SCREENER_TAB", "Oanda-UT-Screener")
-
-    # Read screener rows (pair + row number)
     try:
-        ws, rows = get_screener_rows(sheet_name, screener_tab)
-    except gspread.WorksheetNotFound:
-        logger.warning("Worksheet '%s' not found in sheet '%s'", screener_tab, sheet_name)
+        write_dataframe_to_sheet(df, sheet_name, screener_tab)
+    except Exception as exc:
+        logger.exception("Failed to write screener results to sheet: %s", exc)
+
+    if not screener_rows:
+        logger.info("No UT-style buy + below-MA240 setups this run; no trades placed.")
         return
 
-    if not rows:
-        logger.info("No pairs in screener sheet; nothing to buy this run.")
-        return
+    logger.info("Found %d screener candidates this run.", len(screener_rows))
 
-    logger.info("Found %d screener rows to process", len(rows))
+    # 3) Buyer: immediately trade the candidates
 
-    # Fetch pip locations once per run
-    pip_map = build_pip_location_map(session, base_url, account_id)
+    # Pip locations from instruments list
+    pip_map = build_pip_location_map_from_instruments(fx_instruments)
 
-    # Fetch account summary (use marginAvailable as 'available funds')
+    # Account summary (use marginAvailable as 'available funds')
     account = fetch_account_summary(session, base_url, account_id)
     margin_available_str = account.get("marginAvailable") or account.get("NAV") or account.get("balance")
     margin_available = float(margin_available_str)
@@ -645,7 +574,7 @@ def run_buyer_once():
 
     if margin_available <= 0 or alloc_fraction <= 0:
         logger.warning(
-            "Non-positive margin_available=%.4f or allocation fraction=%.4f; skipping.",
+            "Non-positive margin_available=%.4f or allocation fraction=%.4f; skipping all trades.",
             margin_available,
             alloc_fraction,
         )
@@ -659,13 +588,14 @@ def run_buyer_once():
         notional_per_trade,
     )
 
-    # Build list of instruments in sheet and fetch pricing in one call
-    instruments = [pair for _, pair in rows]
-    prices = fetch_pricing(session, base_url, account_id, instruments)
+    # Fetch pricing for all candidate instruments in one call
+    instruments_to_trade = [row["pair"] for row in screener_rows]
+    prices = fetch_pricing(session, base_url, account_id, instruments_to_trade)
 
-    rows_to_delete: List[int] = []
+    trades_placed = 0
 
-    for row_number, pair in rows:
+    for row in screener_rows:
+        pair = row["pair"]
         price_info = prices.get(pair)
         if not price_info:
             logger.warning("No pricing info for %s; skipping", pair)
@@ -682,11 +612,10 @@ def run_buyer_once():
         # allocation% of available funds per pair => notional / price = units
         units = int(round(notional_per_trade / rounded_price))
 
-        # ---- 1-unit fallback ----
+        # Minimum 1-unit fallback
         if units <= 0 and notional_per_trade > 0:
             logger.info(
-                "Computed units < 1 for %s (notional=%.4f, price=%.8f); "
-                "using minimum 1 unit instead.",
+                "Computed units < 1 for %s (notional=%.4f, price=%.8f); using minimum 1 unit instead.",
                 pair,
                 notional_per_trade,
                 rounded_price,
@@ -712,24 +641,17 @@ def run_buyer_once():
             )
             resp = place_market_order(session, base_url, account_id, pair, units)
             logger.info("Order response for %s: %s", pair, json.dumps(resp))
-
-            # Only delete if order succeeded without raising
-            rows_to_delete.append(row_number)
+            trades_placed += 1
 
         except Exception as exc:
             logger.exception("Failed to place order for %s: %s", pair, exc)
 
-    # Delete rows for which orders were placed successfully
-    if rows_to_delete:
-        delete_sheet_rows(ws, rows_to_delete)
-        logger.info("Finished run: placed %d buys and deleted their rows.", len(rows_to_delete))
-    else:
-        logger.info("Finished run: no successful buys this time.")
+    logger.info("Finished run: placed %d BUY trades.", trades_placed)
 
 
-# ========================
-# Combined main loop
-# ========================
+# ------------------------
+# Main loop
+# ------------------------
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -737,43 +659,25 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    screener_interval = int(os.getenv("UT_SCREENER_INTERVAL_SECONDS", "3600"))
-    buyer_interval = int(os.getenv("BUYER_INTERVAL_SECONDS", "30"))
+    # Single interval for the full cycle (screen + buy).
+    # You can reuse UT_SCREENER_INTERVAL_SECONDS env var, or override with UT_BOT_INTERVAL_SECONDS.
+    interval_seconds = int(
+        os.getenv(
+            "UT_BOT_INTERVAL_SECONDS",
+            os.getenv("UT_SCREENER_INTERVAL_SECONDS", "3600"),  # default 1 hour
+        )
+    )
 
     logger.info(
-        "Starting combined Oanda bot: screener every %ss, buyer every %ss (buys %.3f%% per pair)...",
-        screener_interval,
-        buyer_interval,
+        "Starting autonomous Oanda bot loop (interval=%ss, buys %.3f%% of marginAvailable per pair)...",
+        interval_seconds,
         float(os.getenv("BUYER_ALLOCATION_PERCENT", "0.5")),
     )
 
-    next_screener_time = time.time()
-    next_buyer_time = time.time()
-
     while True:
-        now = time.time()
-
-        # Run screener when due
-        if now >= next_screener_time:
-            try:
-                logger.info("Running UT-style screener...")
-                run_screener_once()
-            except Exception as exc:
-                logger.exception("Error in UT screener: %s", exc)
-            finally:
-                next_screener_time = now + screener_interval
-
-        # Run buyer when due
-        if now >= next_buyer_time:
-            try:
-                logger.info("Running buyer bot...")
-                run_buyer_once()
-            except Exception as exc:
-                logger.exception("Error in buyer bot: %s", exc)
-            finally:
-                next_buyer_time = now + buyer_interval
-
-        # Sleep until the next scheduled event (with a floor)
-        sleep_for = max(1.0, min(next_screener_time, next_buyer_time) - time.time())
-        logger.debug("Sleeping for %.2f seconds...", sleep_for)
-        time.sleep(sleep_for)
+        try:
+            run_bot_once()
+        except Exception as exc:
+            logger.exception("Error in Oanda bot loop: %s", exc)
+        logger.info("Sleeping for %s seconds...", interval_seconds)
+        time.sleep(interval_seconds)
